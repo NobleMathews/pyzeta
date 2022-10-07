@@ -1,16 +1,54 @@
 import asyncio
+import base64
 import json
 import os
+import struct
+from dataclasses import field, dataclass
+from enum import Enum
 from pathlib import Path
-import enum
+from threading import Thread
+from typing import Union, Optional, List, Dict, ClassVar
 
 import solana.rpc.websocket_api
-from loguru import logger
-
 from anchorpy import Idl, Program, Provider, Wallet
+from loguru import logger
 from solana.publickey import PublicKey
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.websocket_api import connect
+from solana.sysvar import SYSVAR_CLOCK_PUBKEY
+
+PublicKeyOrStr = Union[PublicKey, str]
+_MAGIC = 0xA1B2C3D4
+_VERSION_1 = 1
+_VERSION_2 = 2
+_SUPPORTED_VERSIONS = {_VERSION_1, _VERSION_2}
+_ACCOUNT_HEADER_BYTES = 16  # magic + version + type + size, u32 * 4
+_NULL_KEY_BYTES = b'\x00' * PublicKey.LENGTH
+MAX_SLOT_DIFFERENCE = 25
+
+
+class PythPriceStatus(Enum):
+    UNKNOWN = 0
+    TRADING = 1
+    HALTED = 2
+    AUCTION = 3
+
+
+class PythPriceType(Enum):
+    UNKNOWN = 0
+    PRICE = 1
+
+
+# Join exponential moving average for EMA price and EMA confidence
+class EmaType(Enum):
+    UNKNOWN = 0
+    EMA_PRICE_VALUE = 1
+    EMA_PRICE_NUMERATOR = 2
+    EMA_PRICE_DENOMINATOR = 3
+    EMA_CONFIDENCE_VALUE = 4
+    EMA_CONFIDENCE_NUMERATOR = 5
+    EMA_CONFIDENCE_DENOMINATOR = 6
+
 
 current_dir = os.path.dirname(__file__)
 
@@ -49,7 +87,7 @@ MARGIN_ACCOUNT_ASSET_OFFSET = 5764
 SPREAD_ACCOUNT_ASSET_OFFSET = 2305
 
 
-class Asset(enum.Enum):
+class Asset(Enum):
     SOL = 0
     BTC = 1
     ETH = 2
@@ -138,6 +176,7 @@ def get_address(encode_str: str, program_id: PublicKey, mint: PublicKey = None):
 
 class SubExchange:
     def __init__(self, asset: Asset, program_id: PublicKey, program: Program):
+        self.zetaGroup = None
         self.program = program
         self._asset = asset
         underlying_mint = MINTS[asset.name]
@@ -178,12 +217,116 @@ class SubExchange:
         self._insuranceVaultAddress = insuranceVaultAddress
         self._socializedLossAccountAddress = socializedLossAccount
 
-    async def load(self, asset:Asset):
+    async def load(self, asset: Asset):
         logger.info("Loading {} SubExchange", asset.name)
         await self.update_zeta_group()
+        # TODO Subexchange loading [1]
+        # self.markets = await ZetaGroupMarkets.load(this.asset, opts, 0)
 
     async def update_zeta_group(self):
-        self._zetaGroup = await self.program.account
+        self.zetaGroup = await self.program.account
+
+
+@dataclass
+class PythPriceInfo:
+    """
+    Contains price information.
+    Attributes:
+        raw_price (int): the raw price
+        raw_confidence_interval (int): the raw confidence interval
+        price (int): the price
+        confidence_interval (int): the price confidence interval
+        price_status (PythPriceStatus): the price status
+        pub_slot (int): the slot time this price information was published
+        exponent (int): the power-of-10 order of the price
+    """
+
+    LENGTH: ClassVar[int] = 32
+
+    raw_price: int
+    raw_confidence_interval: int
+    price_status: PythPriceStatus
+    pub_slot: int
+    exponent: int
+
+    price: float = field(init=False)
+    confidence_interval: float = field(init=False)
+
+    def __post_init__(self):
+        self.price = self.raw_price * (10 ** self.exponent)
+        self.confidence_interval = self.raw_confidence_interval * \
+                                   (10 ** self.exponent)
+
+    @staticmethod
+    def deserialise(buffer: bytes, offset: int = 0, *, exponent: int):
+        """
+        Deserialise the data in the given buffer into a PythPriceInfo object.
+        Structure:
+            price (i64)
+            confidence interval of price (u64)
+            status (u32 PythPriceStatus)
+            corporate action (u32, currently unused)
+            slot (u64)
+        """
+        # _ is corporate_action
+        price, confidence_interval, price_status, _, pub_slot = struct.unpack_from(
+            "<qQIIQ", buffer, offset)
+        return PythPriceInfo(price, confidence_interval, PythPriceStatus(price_status), pub_slot, exponent)
+
+    def __str__(self) -> str:
+        return f"PythPriceInfo status {self.price_status} price {self.price}"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
+def _read_public_key_or_none(buffer: bytes, offset: int = 0) -> Optional[PublicKey]:
+    buffer = buffer[offset:offset + PublicKey.LENGTH]
+    if buffer == _NULL_KEY_BYTES:
+        return None
+    return PublicKey(buffer)
+
+
+@dataclass
+class PythPriceComponent:
+    """
+    Represents a price component. This is the individual prices each
+    publisher sends in addition to their aggregate.
+    Attributes:
+        publisher_key (SolanaPublicKey): the public key of the publisher
+        last_aggregate_price_info (PythPriceInfo): the price information from this
+            publisher used in the last aggregate price
+        latest_price_info (PythPriceInfo): the latest price information from this
+            publisher
+        exponent (int): the power-of-10 order for all the raw price information
+            in this price component
+    """
+
+    LENGTH: ClassVar[int] = PublicKey.LENGTH + 2 * PythPriceInfo.LENGTH
+
+    publisher_key: PublicKey
+    last_aggregate_price_info: PythPriceInfo
+    latest_price_info: PythPriceInfo
+    exponent: int
+
+    @staticmethod
+    def deserialise(buffer: bytes, offset: int = 0, *, exponent: int):
+        """
+        Deserialise the data in the given buffer into a PythPriceComponent object.
+        Structure:
+            key of quoter (char[32])
+            contributing price to last aggregate (PythPriceInfo)
+            latest contributing price (PythPriceInfo)
+        """
+        key = _read_public_key_or_none(buffer, offset)
+        if key is None:
+            return None
+        offset += PublicKey.LENGTH
+        last_aggregate_price = PythPriceInfo.deserialise(
+            buffer, offset, exponent=exponent)
+        offset += PythPriceInfo.LENGTH
+        latest_price = PythPriceInfo.deserialise(buffer, offset, exponent=exponent)
+        return PythPriceComponent(key, last_aggregate_price, latest_price, exponent)
 
 
 class RiskCalculator:
@@ -192,28 +335,97 @@ class RiskCalculator:
         for asset in assets:
             self._margin_requirements[asset.name] = ACTIVE_MARKETS
 
-class Oracle:
-    def __init__(self, network: str, client: AsyncClient):
-        self._network = network
-        self._client = client
-        self.subscription_ids = {}
-        self._data = {}
-        self.callback = None
 
-    async def subscribe_price_feeds(self, asset_list: list[Asset], callback):
-        self._callback = callback
-        # tasks = []
-        for asset in asset_list:
-            logger.info("Oracle subscribing to feed {}", asset.name)
-            price_address = PYTH_PRICE_FEEDS[self._network][asset.name]
-            async with connect(CLUSTER_URLS[self._network].replace("https", "wss")) as websocket:
-                websocket: solana.rpc.websocket_api.SolanaWsClientProtocol
-                await websocket.account_subscribe(price_address)
-                first_resp = await websocket.recv()
-                subscription_id = first_resp.result
-                next_resp = await websocket.recv()
-                await websocket.logs_unsubscribe(subscription_id)
-            # tasks.append(task)
+class PriceAccount:
+    def __init__(self, product):
+        self.product = product
+        self.price_type = PythPriceType.UNKNOWN
+        self.exponent: Optional[int] = None
+        self.num_components: int = 0
+        self.last_slot: int = 0
+        self.valid_slot: int = 0
+        self.product_account_key: Optional[PublicKey] = None
+        self.next_price_account_key: Optional[PublicKey] = None
+        self.aggregate_price_info: Optional[PythPriceInfo] = None
+        self.price_components: List[PythPriceComponent] = []
+        self.derivations: Dict[EmaType, int] = {}
+        self.timestamp: int = 0  # unix timestamp in seconds
+        self.min_publishers: Optional[int] = None
+        self.prev_timestamp: int = 0  # unix timestamp in seconds
+
+    def update_from(self, buffer: bytes, *, version: int, offset: int = 0) -> None:
+        """
+        Update the data in this price account from the given buffer.
+        Structure:
+            price type (u32 PythPriceType)
+            exponent (i32)
+            number of component prices (u32)
+                (? unclear if this is supposed to match the number of
+                    PythPriceComponents below)
+            unused (u32)
+            currently accumulating price slot (u64)
+            slot of current aggregate price (u64)
+            derivations (u64[6] - array index corresponds to (DeriveType - 1) - v2 only)
+            unused derivation values and minimum publishers (u64[2], i32[2], )
+            product account key (char[32])
+            next price account key (char[32])
+            account key of quoter who computed last aggregate price (char[32])
+            aggregate price info (PythPriceInfo)
+            price components (PythPriceComponent[up to 16 (v1) / up to 32 (v2)])
+        """
+        if version == _VERSION_2:
+            price_type, exponent, num_components = struct.unpack_from("<IiI", buffer, offset)
+            offset += 16  # struct.calcsize("IiII") (last I is the number of quoters that make up the aggregate)
+            last_slot, valid_slot = struct.unpack_from("<QQ", buffer, offset)
+            offset += 16  # struct.calcsize("QQ")
+            derivations = list(struct.unpack_from("<6q", buffer, offset))
+            self.derivations = dict((type_, derivations[type_.value - 1]) for type_ in
+                                    [EmaType.EMA_CONFIDENCE_VALUE, EmaType.EMA_PRICE_VALUE])
+            offset += 48  # struct.calcsize("6q")
+            # drv[2-4]_ fields are currently unused
+            timestamp, min_publishers = struct.unpack_from("<qB", buffer, offset)
+            offset += 16  # struct.calcsize("qBbhi") ("bhi" is drv_2, drv_3, drv_4)
+            product_account_key_bytes, next_price_account_key_bytes = struct.unpack_from("32s32s", buffer, offset)
+            offset += 88  # struct.calcsize("32s32sQqQ") ("QqQ" is prev_slot, prev_price, prev_conf)
+            prev_timestamp = struct.unpack_from("<q", buffer, offset)[0]
+            offset += 8  # struct.calcsize("q")
+            self.timestamp = timestamp
+            self.min_publishers = min_publishers
+            self.prev_timestamp = prev_timestamp
+        elif version == _VERSION_1:
+            price_type, exponent, num_components, _, last_slot, valid_slot, product_account_key_bytes, next_price_account_key_bytes, aggregator_key_bytes = struct.unpack_from(
+                "<IiIIQQ32s32s32s", buffer, offset)
+            self.derivations = {}
+            offset += 128  # struct.calcsize("<IiIIQQ32s32s32s")
+        else:
+            assert False
+
+        # aggregate price info (PythPriceInfo)
+        aggregate_price_info = PythPriceInfo.deserialise(
+            buffer, offset, exponent=exponent)
+
+        # price components (PythPriceComponent[up to 16 (v1) / up to 32 (v2)])
+        price_components: List[PythPriceComponent] = []
+        offset += PythPriceInfo.LENGTH
+        buffer_len = len(buffer)
+        while offset < buffer_len:
+            component = PythPriceComponent.deserialise(
+                buffer, offset, exponent=exponent)
+            if not component:
+                break
+            price_components.append(component)
+            offset += PythPriceComponent.LENGTH
+
+        self.price_type = PythPriceType(price_type)
+        self.exponent = exponent
+        self.num_components = num_components
+        self.last_slot = last_slot
+        self.valid_slot = valid_slot
+        self.product_account_key = PublicKey(product_account_key_bytes)
+        self.next_price_account_key = _read_public_key_or_none(
+            next_price_account_key_bytes)
+        self.aggregate_price_info = aggregate_price_info
+        self.price_components = price_components
 
 
 class Exchange:
@@ -221,9 +433,12 @@ class Exchange:
                  program_key: str,
                  network: str,
                  client: AsyncClient,
-                 wallet= Wallet.dummy()):
+                 wallet=Wallet.dummy()):
+        self._poll_interval = DEFAULT_EXCHANGE_POLL_INTERVAL
+        self.clockSlot = None
         self.program_id = PublicKey(program_key)
         self._assets = assets
+        self._network = network
         self._provider = Provider(client, wallet)
         self._sub_exchanges = {}
         idl_path = os.path.join(current_dir, "idl/zeta.json")
@@ -251,6 +466,7 @@ class Exchange:
         self._stateAddress = state
         self._serumAuthority = serumAuthority
         self._usdcMintAddress = USDC_MINT_ADDRESS[network]
+        self.clockTimestamp = None
 
         (treasuryWallet, _) = get_address(
             "zeta-treasury-wallet",
@@ -259,7 +475,7 @@ class Exchange:
         )
 
         self._treasuryWalletAddress = treasuryWallet
-    
+
         (referralsRewardsWallet, _) = get_address(
             "zeta-referrals-rewards-wallet",
             self.program_id,
@@ -267,13 +483,28 @@ class Exchange:
         )
 
         self._referralsRewardsWalletAddress = referralsRewardsWallet
-        
-        self._lastPollTimestamp = 0
-        
-        self._oracle = Oracle(network, client)
 
-    async def load(self):
-        await self.subscribe_oracle(self._assets, None)
+        self._lastPollTimestamp = 0
+
+        self._oracle = Oracle(self, network, client)
+
+    def set_clock_data(self, data: bytes):
+        slot, _epochStartTimestamp, _epoch, _leaderScheduleEpoch, unix_timestamp = struct.unpack_from("<QqQQq", data, 0)
+        self.clockTimestamp = unix_timestamp
+        self.clockSlot = slot
+
+    def subscribe_clock(self, callback):
+        logger.info("Subscribing to clock")
+        wss = CLUSTER_URLS[self._network].replace("https", "wss")
+        ws_run = Thread(target=asyncio.run,
+                        args=(generic_subscriber(wss, SYSVAR_CLOCK_PUBKEY, self.set_clock_data),))
+        ws_run.start()
+        if self.clockTimestamp and self.clockTimestamp > self._lastPollTimestamp + self._poll_interval:
+            self._lastPollTimestamp = self.clockTimestamp
+            # TODO handle subexchange polling [Deferred]
+
+    async def load(self, callback):
+        await self.subscribe_oracle(self._assets, callback)
         #
         # await Promise.all(
         #     self.assets.map(async(asset) => {
@@ -295,16 +526,108 @@ class Exchange:
         # )
         #
         # await self.updateState()
-        # await self.subscribeClock(callback)
+        self.subscribe_clock(None)
 
     def display_state(self):
         for asset, sub_exchange in self._sub_exchanges.items():
             ordered_indexes = [
-                sub_exchange
+                sub_exchange.zetaGroup
             ]
 
     async def subscribe_oracle(self, assets, callback):
         await self._oracle.subscribe_price_feeds(assets, callback)
+
+
+def _parse_header(buffer: bytes, offset: int = 0):
+    if len(buffer) - offset < _ACCOUNT_HEADER_BYTES:
+        raise ValueError("Pyth account data too short")
+
+    # Pyth magic (u32) == MAGIC
+    # version (u32) == VERSION_1 or 2
+    # account type (u32)
+    # account data size (u32)
+    magic, version, type_, size = struct.unpack_from("<IIII", buffer, offset)
+
+    if len(buffer) < size:
+        raise ValueError(
+            f"Pyth header says data is {size} bytes, but buffer only has {len(buffer)} bytes")
+
+    if magic != _MAGIC:
+        raise ValueError(
+            f"Pyth account data header has wrong magic: expected {_MAGIC:08x}, got {magic:08x}")
+
+    if version not in _SUPPORTED_VERSIONS:
+        raise ValueError(
+            f"Pyth account data has unsupported version {version}")
+
+    return size, version
+
+
+async def generic_subscriber(wss, address, callback, added_params=(), sub_ids=None, sub=None):
+    if sub_ids is None:
+        sub_ids = {}
+    async with connect(wss) as websocket:
+        websocket: solana.rpc.websocket_api.SolanaWsClientProtocol
+        await websocket.account_subscribe(address, encoding="base64")
+        first_resp = await websocket.recv()
+        subscription_id = first_resp.result
+        sub_ids[sub] = subscription_id
+        msg: solana.rpc.websocket_api.AccountNotification
+        async for msg in websocket:
+            # if not subscriptions_alive:
+            #     break
+            data_base64, _data_format = msg.result.value.data
+            data = base64.b64decode(data_base64)
+            callback(data, *added_params)
+        await websocket.logs_unsubscribe(subscription_id)
+        # next_resp = await websocket.recv()
+        # await websocket.logs_unsubscribe(subscription_id)
+
+
+class Oracle:
+    def __init__(self, exchange: Exchange, network: str, client: AsyncClient):
+        self._callback = None
+        self._network = network
+        self._exchange = exchange
+        self._client = client
+        self.subscription_ids = {}
+        self._data = {}
+        self.callback = None
+        self.subscriptions_alive = True
+
+    async def subscribe_price_feeds(self, asset_list: list[Asset], callback):
+        self._callback = callback
+        # tasks = []
+        for asset in asset_list:
+            logger.info("Oracle subscribing to feed {}", asset.name)
+            price_address = PYTH_PRICE_FEEDS[self._network][asset.name]
+            wss = CLUSTER_URLS[self._network].replace("https", "wss")
+            added_params = (asset, self)
+            ws_run = Thread(target=asyncio.run,
+                            args=(
+                                generic_subscriber(wss, price_address, price_callback, added_params,
+                                                   self.subscription_ids,
+                                                   asset),))
+            ws_run.start()
+            # await self.run_forever(asset)
+            # tasks.append(task)
+
+
+def price_callback(data, asset, self: Oracle):
+    exchange = self._exchange
+    size, version = _parse_header(data, 0)
+    price_acc = PriceAccount(asset.name)
+    price_acc.update_from(data[:size], version=version, offset=_ACCOUNT_HEADER_BYTES)
+    price_info = price_acc.aggregate_price_info
+    oracle_data = {
+        asset.name: asset.name,
+        "price": price_info.price,
+        "lastUpdatedTime": exchange.clockTimestamp,
+        "lastUpdatedSlot": price_info.pub_slot
+    }
+    self._data[asset] = oracle_data
+    if self.callback is not None:
+        self.callback(asset, oracle_data)
 
 
 def cli():

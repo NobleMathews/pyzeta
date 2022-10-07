@@ -1,12 +1,12 @@
 import asyncio
 import os
 
-from anchorpy import Provider, Wallet
+import requests
+from anchorpy import Wallet
 from dotenv import load_dotenv
+from loguru import logger
 from solana.keypair import Keypair
 from solana.rpc.async_api import AsyncClient, Commitment
-import requests
-from loguru import logger
 
 from pyzeta import Exchange, Asset, CLUSTER_URLS
 
@@ -27,7 +27,8 @@ async def main():
         wallet.public_key,
         encoding="base64"
     )
-    if response['result']['value']['lamports'] < 100000000:
+    my_lamports = response['result']['value']
+    if my_lamports is None or my_lamports['lamports'] < 100000000:
         await client.request_airdrop(wallet.public_key, 100000000)
         response = requests.post(f"{SERVER_URL}/faucet/usdc", json={
             "key": str(wallet.public_key),
@@ -44,8 +45,10 @@ async def main():
         None
     )
 
-    await exchange.load()
+    await exchange.load(None)
 
     exchange.display_state()
     await client.close()
+
+
 asyncio.run(main())

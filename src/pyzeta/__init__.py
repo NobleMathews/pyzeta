@@ -1,21 +1,91 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
 import os
 import struct
+import typing
 from dataclasses import field, dataclass
 from enum import Enum
 from pathlib import Path
 from threading import Thread
 from typing import Union, Optional, List, Dict, ClassVar
 
+import solana.rpc.api
 import solana.rpc.websocket_api
 from anchorpy import Idl, Program, Provider, Wallet
 from loguru import logger
 from solana.publickey import PublicKey
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.websocket_api import connect
+from solana.system_program import SYS_PROGRAM_ID
 from solana.sysvar import SYSVAR_CLOCK_PUBKEY
+from solana.sysvar import SYSVAR_RENT_PUBKEY
+from solana.transaction import Transaction
+from solana.transaction import TransactionInstruction, AccountMeta, TransactionSignature
+from spl.token.constants import TOKEN_PROGRAM_ID
+
+Exchange_network = "devnet"
+Exchange_program_id = PublicKey("BG3oRikW8d16YjUEmX3ZxHm9SiJzrGtMhsSR8aCw1Cd7")
+
+
+class Side(Enum):
+    BID = "bid"
+    ASK = "ask"
+
+
+class OrderType(Enum):
+    LIMIT = "limit"
+    POSTONLY = "postonly"
+    FILLORKILL = "fillOrKill"
+
+
+class InitializeOpenOrdersAccounts(typing.TypedDict):
+    state: PublicKey
+    zeta_group: PublicKey
+    dex_program: PublicKey
+    system_program: PublicKey
+    open_orders: PublicKey
+    margin_account: PublicKey
+    authority: PublicKey
+    payer: PublicKey
+    market: PublicKey
+    serum_authority: PublicKey
+    open_orders_map: PublicKey
+    rent: PublicKey
+
+
+def initialize_open_orders(
+        accounts: InitializeOpenOrdersAccounts,
+) -> TransactionInstruction:
+    keys: list[AccountMeta] = [
+        AccountMeta(pubkey=accounts["state"], is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts["zeta_group"], is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts["dex_program"], is_signer=False, is_writable=False),
+        AccountMeta(
+            pubkey=accounts["system_program"], is_signer=False, is_writable=False
+        ),
+        AccountMeta(pubkey=accounts["open_orders"], is_signer=False, is_writable=True),
+        AccountMeta(
+            pubkey=accounts["margin_account"], is_signer=False, is_writable=True
+        ),
+        AccountMeta(pubkey=accounts["authority"], is_signer=True, is_writable=False),
+        AccountMeta(pubkey=accounts["payer"], is_signer=True, is_writable=True),
+        AccountMeta(pubkey=accounts["market"], is_signer=False, is_writable=False),
+        AccountMeta(
+            pubkey=accounts["serum_authority"], is_signer=False, is_writable=False
+        ),
+        AccountMeta(
+            pubkey=accounts["open_orders_map"], is_signer=False, is_writable=True
+        ),
+        AccountMeta(pubkey=accounts["rent"], is_signer=False, is_writable=False),
+    ]
+    identifier = b"7\xea\x10Rd*~\xc0"
+    encoded_args = b""
+    data = identifier + encoded_args
+    return TransactionInstruction(keys, Exchange_program_id, data)
+
 
 PublicKeyOrStr = Union[PublicKey, str]
 _MAGIC = 0xA1B2C3D4
@@ -175,8 +245,16 @@ def get_address(encode_str: str, program_id: PublicKey, mint: PublicKey = None):
 
 
 class SubExchange:
+    @property
+    def zeta_group(self):
+        return self._zeta_group
+
+    @property
+    def zeta_group_address(self):
+        return self._zeta_group_address
+
     def __init__(self, asset: Asset, program_id: PublicKey, program: Program):
-        self.zetaGroup = None
+        self._zeta_group = None
         self.program = program
         self._asset = asset
         underlying_mint = MINTS[asset.name]
@@ -185,12 +263,12 @@ class SubExchange:
             program_id,
             underlying_mint
         )
-        self._zetaGroupAddress = zetaGroup
+        self._zeta_group_address = zetaGroup
 
         (greeks, _) = get_address(
             "greeks",
             program_id,
-            self._zetaGroupAddress
+            self._zeta_group_address
         )
 
         self._greeksAddress = greeks
@@ -198,19 +276,19 @@ class SubExchange:
         (vaultAddress, _) = get_address(
             "vault",
             program_id,
-            self._zetaGroupAddress
+            self._zeta_group_address
         )
 
         (insuranceVaultAddress, _) = get_address(
             "zeta-insurance-vault",
             program_id,
-            self._zetaGroupAddress
+            self._zeta_group_address
         )
 
         (socializedLossAccount, _) = get_address(
             "socialized-loss",
             program_id,
-            self._zetaGroupAddress
+            self._zeta_group_address
         )
 
         self._vaultAddress = vaultAddress
@@ -224,7 +302,7 @@ class SubExchange:
         # self.markets = await ZetaGroupMarkets.load(this.asset, opts, 0)
 
     async def update_zeta_group(self):
-        self.zetaGroup = await self.program.account
+        self._zeta_group = await self.program.account
 
 
 @dataclass
@@ -531,7 +609,7 @@ class Exchange:
     def display_state(self):
         for asset, sub_exchange in self._sub_exchanges.items():
             ordered_indexes = [
-                sub_exchange.zetaGroup
+                sub_exchange._zeta_group
             ]
 
     async def subscribe_oracle(self, assets, callback):
@@ -633,3 +711,269 @@ def price_callback(data, asset, self: Oracle):
 def cli():
     # asyncio.run(example())
     print("Welcome to Zeta!")
+
+
+async def get_open_orders(program_id, market, user_key):
+    return await PublicKey.find_program_address(
+        [
+            bytes("open-orders", "utf-8"),
+            bytes(DEX_PID[Exchange_network]),
+            bytes(market),
+            bytes(user_key)
+        ],
+        program_id
+    )
+
+
+async def get_open_orders_map(program_id: PublicKey, open_orders: PublicKey):
+    return await PublicKey.find_program_address(
+        [bytes(open_orders)],
+        program_id
+    )
+
+
+async def initialize_open_orders_ix(asset, market, user_key, margin_account):
+    open_orders_pda, _open_orders_nonce = await get_open_orders(
+        Exchange_program_id,
+        market,
+        user_key
+    )
+
+    open_orders_map, _open_orders_map_nonce = await get_open_orders_map(
+        Exchange_program_id,
+        open_orders_pda
+    )
+
+    return [
+        initialize_open_orders({
+            "state": PublicKey("9VddCF6iEyZbjkCQ4g8VJpjEtuLsgmvRCc6LQwAvXigC"),
+            # Exchange.state_address,
+            "zeta_group": PublicKey("CcLF7qQbgRQqUDmQeEkTSP2UbX82N9G91THjV5uRGCMW"),
+            # Exchange.get_zeta_group_address(asset),
+            "dex_program": DEX_PID[Exchange_network],
+            "system_program": SYS_PROGRAM_ID,
+            "open_orders": open_orders_pda,
+            "margin_account": margin_account,
+            "authority": user_key,
+            "payer": user_key,
+            "market": market,
+            "rent": SYSVAR_RENT_PUBKEY,
+            "serum_authority": PublicKey("7m134nU79ezr3b7jYSehnhto94AvSP4yexa3Wdhxff99"),
+            # Exchange._serum_authority,
+            "open_orders_map": open_orders_map
+        }),
+        open_orders_pda
+    ]
+
+
+async def process_transaction(provider: Provider, tx: Transaction, signers=None, opts=None, use_ledger=False):
+    txSig = TransactionSignature()
+    blockhash = await provider.connection.get_recent_blockhash()
+    tx.recent_blockhash = blockhash
+    # Exchange.ledger_wallet.public_key if use_ledger else
+    tx.fee_payer = provider.wallet.public_key
+    if signers is None:
+        signers = []
+
+    for s in signers:
+        if s is not None:
+            tx.sign_partial(s)
+
+        # if use_ledger:
+        #     tx = await Exchange.ledger_wallet.sign_transaction(tx)
+        # else:
+    tx = await provider.wallet.sign_transaction(tx)
+
+    try:
+        tx_sig = await solana.rpc.api.Client.send_raw_transaction(tx.serialize(), opts)
+        return tx_sig
+    except:
+        raise Exception("Error in process_transaction")
+
+
+def to_program_side(side):
+    if side == Side.BID:
+        return {"bid": {}}
+    if side == Side.ASK:
+        return {"ask": {}}
+    raise Exception("Invalid side")
+
+
+def to_program_order_type(orderType):
+    if orderType == OrderType.LIMIT:
+        return {"limit": {}}
+    if orderType == OrderType.POSTONLY:
+        return {"postOnly": {}}
+    if orderType == OrderType.FILLORKILL:
+        return {"fillOrKill": {}}
+
+
+def place_order_v3_ix(asset, market_index, price, size, side, order_type, client_order_id, tag, margin_account,
+                      authority, open_orders, whitelist_trading_fees_account):
+    if len(tag) > MAX_ORDER_TAG_LENGTH:
+        raise Exception("Tag is too long! Max length = " + str(MAX_ORDER_TAG_LENGTH))
+
+    # sub_exchange = Exchange.get_sub_exchange(asset)
+    # market_data = sub_exchange.markets.markets[market_index]
+    remaining_accounts = [
+        {
+            "pubkey": whitelist_trading_fees_account,
+            "is_signer": False,
+            "is_writable": False,
+        },
+    ] if whitelist_trading_fees_account is None else []
+
+    return place_order_v3(
+        {
+            "price": price,
+            "size": size,
+            "side": to_program_side(side),
+            "order_type": to_program_order_type(order_type),
+            "client_order_id": None if client_order_id == 0 else client_order_id,
+        },
+        {
+            "state": PublicKey("9VddCF6iEyZbjkCQ4g8VJpjEtuLsgmvRCc6LQwAvXigC"),
+            # Exchange.state_address,
+            "zeta_group": PublicKey("CcLF7qQbgRQqUDmQeEkTSP2UbX82N9G91THjV5uRGCMW"),
+            # "zeta_group": sub_exchange.zeta_group_address,
+            "margin_account": margin_account,
+            "authority": authority,
+            "dex_program": DEX_PID[Exchange_network],
+            "token_program": TOKEN_PROGRAM_ID,
+            "serum_authority": PublicKey("7m134nU79ezr3b7jYSehnhto94AvSP4yexa3Wdhxff99"),
+            # Exchange._serum_authority,
+            "greeks": PublicKey("4WKZv9ptg7zc9WCdyK7y5UfJsr3ACPeBiqWXirDQrDhV"),
+            # sub_exchange.zeta_group.greeks,
+            "open_orders": open_orders,
+            "rent": SYSVAR_RENT_PUBKEY,
+            "market_accounts": {
+                "asks": PublicKey("59eaBiRzude5h8vwx8SkPMWAGad7ag3g9pErbyiqV55F"),
+                "bids": PublicKey("9dFLWFpWdXbpWcgfVRXqPzFBrYNqV9zs83Hd3QZyzGWF"),
+                "coin_vault": PublicKey("Fck8esUdZ3Gku4Uy3rgFZyy8bqhaAL5iKPpCR69PMMBc"),
+                "coin_wallet": PublicKey("Bb5yvLhfD7JFXdZUfhnXpUwgmCo4ZsAyrBBY6rZuVJaN"),
+                "event_queue": PublicKey("2ExH97tjdj25Hi5JQHGx3jgMUnxhMjpkdyw3GvC7Kd4N"),
+                "market": PublicKey("2YJaZTe5FGDbjbXmKLMw28L7ZhsgaxrFbGmN6Wdc42UN"),
+                "order_payer_token_account": PublicKey(
+                    "D4vzFUHHCkv6oN6gFyYzt9wjXjbPRmyXGzwioDo367Bz") if Side.BID else PublicKey(
+                    "Bb5yvLhfD7JFXdZUfhnXpUwgmCo4ZsAyrBBY6rZuVJaN"),
+                "pc_vault": PublicKey("46tATCNejhV5d62XTwzHcmUTaLL6ftoErojTygvCk4Vx"),
+                "pc_wallet": PublicKey("D4vzFUHHCkv6oN6gFyYzt9wjXjbPRmyXGzwioDo367Bz"),
+                "request_queue": PublicKey("6pfFXyNovSso6g57rojKD6d6RLSn1motbP4AevpEwR7L"),
+            },
+            #     {
+            #     "market": market_data.serum_market.decoded.own_address,
+            #     "request_queue": market_data.serum_market.decoded.request_queue,
+            #     "event_queue": market_data.serum_market.decoded.event_queue,
+            #     "bids": market_data.serum_market.decoded.bids,
+            #     "asks": market_data.serum_market.decoded.asks,
+            #     "coin_vault": market_data.serum_market.decoded.base_vault,
+            #     "pc_vault": market_data.serum_market.decoded.quote_vault,
+            #     "order_payer_token_account": market_data.quote_vault if Side.BID else market_data.base_vault,
+            #     "coin_wallet": market_data.base_vault,
+            #     "pc_wallet": market_data.quote_vault,
+            # },
+
+            "oracle": PublicKey("HovQMDrbAgAYPCmHVSrezcSmkMtXSSUsLDFANExrZh2J"),
+            # sub_exchange.zeta_group.oracle,
+            "market_node": PublicKey("2oR2TGmRFVMWNCVSJ9zQGGm64PcY4LbwyCSNHjQ7VGUH"),
+            # sub_exchange.greeks.node_keys[market_index]
+            "market_mint": PublicKey(
+                "HTq7MqyG5t9ifByHabjtDndbRtA67dQ8YovhiAbb69h5") if side == Side.BID else PublicKey(
+                "C8m11wQ89ugMUDdm1gjgE7vsHF1nP9AN1x886qYHjXQK"),
+            # market_data.serum_market.quote_mint_address
+            # market_data.serum_market.base_mint_address,
+            "mint_authority": PublicKey("278LYD3sfoYF9tbcYf2HatzGYGu8VuQ7SjpSFwAgGMY2"),
+            # Exchange._mint_authority,
+        },
+        market_index=market_index
+    )
+
+
+class Client:
+    def __init__(self, connection, wallet: Wallet, opts):
+        self._provider = Provider(connection, wallet, opts)
+        self._subclients = {}
+        self._referral_account = None
+        self._referrer_account = None
+        self._referrer_account = None
+        self._whitelist_deposit_address = None
+        self._whitelist_trading_fees_address = None
+        self._usdc_account_address = None
+        self._referral_alias = None
+
+    async def place_order(self, asset, market, price, size, side, type, client_order_id, tag):
+        ret = await self.get_sub_client(asset).place_order_v3(
+            self.market_identifier_to_public_key(asset, market),
+            price,
+            size,
+            side,
+            type,
+            client_order_id,
+            tag
+        )
+        return ret
+
+
+class SubClient:
+    def __init__(self, asset, parent):
+        self._asset = asset
+        self._sub_exchange = Exchange.get_sub_exchange(self, asset)
+        self._open_orders_accounts = []
+        for i in range(len(self._sub_exchange.zeta_group.products)):
+            self._open_orders_accounts.append(PublicKey("11111111111111111111111111111111"))
+        self._parent = parent
+
+        self._margin_positions = []
+        self._spread_positions = []
+        self._orders = []
+        self._last_update_timestamp = 0
+        self._pending_update = False
+        self._margin_account = None
+        self._margin_account_address = None
+        self._spread_account = None
+        self._poll_interval = DEFAULT_CLIENT_POLL_INTERVAL
+        self._updating_state = False
+        self._updating_state_timestamp = None
+        self._spread_account_address = None
+        self._callback = None
+        self._connection = None
+        self._pending_update_slot = 0
+
+    async def place_order_v3(self, market, price, size, side, order_type, client_order_id, tag, market_index):
+        tx = Transaction()
+        # market_index = self._sub_exchange.markets.get_market_index(market)
+
+        open_orders_pda = None
+        if self._open_orders_accounts[market_index] == PublicKey("11111111111111111111111111111111"):
+            print("User doesn't have open orders account for this asset. Initializing for market: " + str(market))
+            init_ix, _open_orders_pda = await initialize_open_orders_ix(
+                self._asset,
+                market,
+                self._parent.public_key(),
+                self._margin_account_address
+            )
+            open_orders_pda = _open_orders_pda
+            tx.add(init_ix)
+        else:
+            open_orders_pda = self._open_orders_accounts[market_index]
+
+        order_ix = place_order_v3_ix(
+            self._asset,
+            market_index,
+            price,
+            size,
+            side,
+            order_type,
+            client_order_id,
+            tag,
+            self._margin_account_address,
+            self._parent.public_key(),
+            open_orders_pda,
+            self._parent.whitelist_trading_fees_address
+        )
+
+        tx.add(order_ix)
+
+        txId = await process_transaction(self._parent.provider, tx)
+        self._open_orders_accounts[market_index] = open_orders_pda
+        return txId

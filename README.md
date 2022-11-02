@@ -1,3 +1,6 @@
+[//]: # (mint token spl package ts)
+[//]: # (https://github.com/Merstab/zeta-py-client)
+
 # pyzeta
 
 Python SDK to interact with Zeta

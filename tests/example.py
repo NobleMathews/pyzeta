@@ -1,5 +1,6 @@
 import asyncio
 import os
+from decimal import Decimal
 
 import requests
 from anchorpy import Wallet
@@ -8,7 +9,7 @@ from loguru import logger
 from solana.keypair import Keypair
 from solana.rpc.async_api import AsyncClient, Commitment
 
-from pyzeta import Exchange, Asset, CLUSTER_URLS
+from pyzeta import CLUSTER_URLS, place_order, Asset, Side, OrderType
 
 load_dotenv()
 
@@ -28,26 +29,35 @@ async def main():
         encoding="base64"
     )
     my_lamports = response['result']['value']
-    if my_lamports is None or my_lamports['lamports'] < 100000000:
-        await client.request_airdrop(wallet.public_key, 100000000)
-        response = requests.post(f"{SERVER_URL}/faucet/usdc", json={
-            "key": str(wallet.public_key),
-            "amount": 10_000
-        })
-        if response.status_code != 200:
-            logger.error("Failed to get USDC")
+    # if my_lamports is None or my_lamports['lamports'] < 100000000:
+    await client.request_airdrop(wallet.public_key, 100000000)
+    response = requests.post(f"{SERVER_URL}/faucet/usdc", json={
+        "key": str(wallet.public_key),
+        "amount": 10_000
+    })
+    if response.status_code != 200:
+        logger.error("Failed to get USDC")
 
-    exchange = Exchange(
-        [Asset.SOL, Asset.BTC],
-        PROGRAM_ID,
-        network,
-        client,
-        None
+    await place_order(
+        Asset.BTC,
+        10,
+        Decimal(0.1),
+        2 / pow(10, 3),
+        Side.BID,
+        OrderType.LIMIT
     )
 
-    await exchange.load(None)
-
-    exchange.display_state()
+    # exchange = Exchange(
+    #     [Asset.SOL, Asset.BTC],
+    #     PROGRAM_ID,
+    #     network,
+    #     client,
+    #     None
+    # )
+    #
+    # await exchange.load(None)
+    #
+    # exchange.display_state()
     await client.close()
 
 

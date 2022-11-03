@@ -1,8 +1,8 @@
 import asyncio
 import os
-from decimal import Decimal
 
 import requests
+from anchorpy import Provider
 from anchorpy import Wallet
 from dotenv import load_dotenv
 from loguru import logger
@@ -38,13 +38,18 @@ async def main():
     if response.status_code != 200:
         logger.error("Failed to get USDC")
 
+    provider = Provider(client, wallet)
+
     await place_order(
+        provider,
         Asset.BTC,
         10,
-        Decimal(0.1),
-        2 / pow(10, 3),
+        100000,
+        # Decimal(0.1),
+        2000,
+        # 2 / pow(10, 3),
         Side.BID,
-        OrderType.LIMIT
+        OrderType.LIMIT,
     )
 
     # exchange = Exchange(

@@ -23,8 +23,11 @@ from solana.system_program import SYS_PROGRAM_ID
 from solana.sysvar import SYSVAR_CLOCK_PUBKEY
 from solana.sysvar import SYSVAR_RENT_PUBKEY
 from solana.transaction import Transaction
-from solana.transaction import TransactionInstruction, AccountMeta, TransactionSignature
+from solana.transaction import TransactionInstruction, AccountMeta
 from spl.token.constants import TOKEN_PROGRAM_ID
+
+import pyzeta.instructions
+import pyzeta.types
 
 Exchange_network = "devnet"
 Exchange_program_id = PublicKey("BG3oRikW8d16YjUEmX3ZxHm9SiJzrGtMhsSR8aCw1Cd7")
@@ -38,7 +41,7 @@ class Side(Enum):
 class OrderType(Enum):
     LIMIT = "limit"
     POSTONLY = "postonly"
-    FILLORKILL = "fillOrKill"
+    FILLORKILL = "FillOrKill"
 
 
 class InitializeOpenOrdersAccounts(typing.TypedDict):
@@ -714,7 +717,7 @@ def cli():
 
 
 async def get_open_orders(program_id, market, user_key):
-    return await PublicKey.find_program_address(
+    return PublicKey.find_program_address(
         [
             bytes("open-orders", "utf-8"),
             bytes(DEX_PID[Exchange_network]),
@@ -726,7 +729,7 @@ async def get_open_orders(program_id, market, user_key):
 
 
 async def get_open_orders_map(program_id: PublicKey, open_orders: PublicKey):
-    return await PublicKey.find_program_address(
+    return PublicKey.find_program_address(
         [bytes(open_orders)],
         program_id
     )
@@ -767,7 +770,7 @@ async def initialize_open_orders_ix(asset, market, user_key, margin_account):
 
 
 async def process_transaction(provider: Provider, tx: Transaction, signers=None, opts=None, use_ledger=False):
-    txSig = TransactionSignature()
+    # txSig = TransactionSignature()
     blockhash = await provider.connection.get_recent_blockhash()
     tx.recent_blockhash = blockhash
     # Exchange.ledger_wallet.public_key if use_ledger else
@@ -793,17 +796,17 @@ async def process_transaction(provider: Provider, tx: Transaction, signers=None,
 
 def to_program_side(side):
     if side == Side.BID:
-        return {"bid": {}}
+        return {"Bid": {}}
     if side == Side.ASK:
-        return {"ask": {}}
+        return {"Ask": {}}
     raise Exception("Invalid side")
 
 
 def to_program_order_type(orderType):
     if orderType == OrderType.LIMIT:
-        return {"limit": {}}
+        return {"Limit": {}}
     if orderType == OrderType.POSTONLY:
-        return {"postOnly": {}}
+        return {"PostOnly": {}}
     if orderType == OrderType.FILLORKILL:
         return {"fillOrKill": {}}
 
@@ -823,13 +826,14 @@ def place_order_v3_ix(asset, market_index, price, size, side, order_type, client
         },
     ] if whitelist_trading_fees_account is None else []
 
-    return place_order_v3(
+    return pyzeta.instructions.place_order_v3(
         {
             "price": price,
             "size": size,
-            "side": to_program_side(side),
-            "order_type": to_program_order_type(order_type),
+            "side": pyzeta.types.side.from_decoded(to_program_side(side)),
+            "order_type": pyzeta.types.order_type.from_decoded(to_program_order_type(order_type)),
             "client_order_id": None if client_order_id == 0 else client_order_id,
+            "tag": "SDK"
         },
         {
             "state": PublicKey("9VddCF6iEyZbjkCQ4g8VJpjEtuLsgmvRCc6LQwAvXigC"),
@@ -885,95 +889,123 @@ def place_order_v3_ix(asset, market_index, price, size, side, order_type, client
             "mint_authority": PublicKey("278LYD3sfoYF9tbcYf2HatzGYGu8VuQ7SjpSFwAgGMY2"),
             # Exchange._mint_authority,
         },
-        market_index=market_index
     )
 
 
-class Client:
-    def __init__(self, connection, wallet: Wallet, opts):
-        self._provider = Provider(connection, wallet, opts)
-        self._subclients = {}
-        self._referral_account = None
-        self._referrer_account = None
-        self._referrer_account = None
-        self._whitelist_deposit_address = None
-        self._whitelist_trading_fees_address = None
-        self._usdc_account_address = None
-        self._referral_alias = None
+# class Client:
+#     def __init__(self, connection, wallet: Wallet, opts):
+#         self._provider = Provider(connection, wallet, opts)
+#         self._subclients = {}
+#         self._referral_account = None
+#         self._referrer_account = None
+#         self._referrer_account = None
+#         self._whitelist_deposit_address = None
+#         self._whitelist_trading_fees_address = None
+#         self._usdc_account_address = None
+#         self._referral_alias = None
 
-    async def place_order(self, asset, market, price, size, side, type, client_order_id, tag):
-        ret = await self.get_sub_client(asset).place_order_v3(
-            self.market_identifier_to_public_key(asset, market),
-            price,
-            size,
-            side,
-            type,
-            client_order_id,
-            tag
+# async def place_order(self, asset, market, price, size, side, type, client_order_id, tag):
+#     ret = await self.get_sub_client(asset).place_order_v3(
+#         self.market_identifier_to_public_key(asset, market),
+#         price,
+#         size,
+#         side,
+#         type,
+#         client_order_id,
+#         tag
+#     )
+#     return ret
+
+
+# class SubClient:
+#     def __init__(self, asset, parent):
+#         self._asset = asset
+#         # self._sub_exchange = Exchange.get_sub_exchange(self, asset)
+#         self._open_orders_accounts = []
+#         for i in range(len(self._sub_exchange.zeta_group.products)):
+#             self._open_orders_accounts.append(PublicKey("11111111111111111111111111111111"))
+#         self._parent = parent
+#
+#         self._margin_positions = []
+#         self._spread_positions = []
+#         self._orders = []
+#         self._last_update_timestamp = 0
+#         self._pending_update = False
+#         self._margin_account = None
+#         self._margin_account_address = None
+#         self._spread_account = None
+#         self._poll_interval = DEFAULT_CLIENT_POLL_INTERVAL
+#         self._updating_state = False
+#         self._updating_state_timestamp = None
+#         self._spread_account_address = None
+#         self._callback = None
+#         self._connection = None
+#         self._pending_update_slot = 0
+_open_orders_accounts = [PublicKey("11111111111111111111111111111111")] * 46
+
+
+# len(Exchange.zetaGroup.products)
+
+
+async def place_order_v3(provider, market, price, size, side, order_type, client_order_id, tag, market_index):
+    tx = Transaction()
+    # market_index = self._sub_exchange.markets.get_market_index(market)
+    open_orders_pda = None
+    if _open_orders_accounts[market_index] == PublicKey("11111111111111111111111111111111"):
+        print("User doesn't have open orders account for this asset. Initializing for market: " + str(market))
+        init_ix, _open_orders_pda = await initialize_open_orders_ix(
+            # self._asset,
+            None,
+            market,
+            # TODO ! ASK what to set here
+            PublicKey("2cBRcusmXXQeoMUte4DxqXEThM4cTrNPQ1VsBZwZ9kcM"),
+            # self._parent.public_key(),
+            PublicKey("D84vvCFFSQBfeiT89fyR9GP3hDEas7MWveZwwsiG93Kx"),
+            # self._margin_account_address
         )
-        return ret
+        open_orders_pda = _open_orders_pda
+        tx.add(init_ix)
+    else:
+        open_orders_pda = _open_orders_accounts[market_index]
+
+    order_ix = place_order_v3_ix(
+        # self._asset,
+        None,
+        market_index,
+        price,
+        size,
+        side,
+        order_type,
+        client_order_id,
+        tag,
+        PublicKey("D84vvCFFSQBfeiT89fyR9GP3hDEas7MWveZwwsiG93Kx"),
+        # self._margin_account_address,
+        PublicKey("D84vvCFFSQBfeiT89fyR9GP3hDEas7MWveZwwsiG93Kx"),
+        # self._parent.public_key(),
+        open_orders_pda,
+        # TODO ASK what is this
+        None
+        # self._parent.whitelist_trading_fees_address
+    )
+
+    tx.add(order_ix)
+
+    txId = await process_transaction(provider, tx)
+    _open_orders_accounts[market_index] = open_orders_pda
+    return txId
 
 
-class SubClient:
-    def __init__(self, asset, parent):
-        self._asset = asset
-        self._sub_exchange = Exchange.get_sub_exchange(self, asset)
-        self._open_orders_accounts = []
-        for i in range(len(self._sub_exchange.zeta_group.products)):
-            self._open_orders_accounts.append(PublicKey("11111111111111111111111111111111"))
-        self._parent = parent
-
-        self._margin_positions = []
-        self._spread_positions = []
-        self._orders = []
-        self._last_update_timestamp = 0
-        self._pending_update = False
-        self._margin_account = None
-        self._margin_account_address = None
-        self._spread_account = None
-        self._poll_interval = DEFAULT_CLIENT_POLL_INTERVAL
-        self._updating_state = False
-        self._updating_state_timestamp = None
-        self._spread_account_address = None
-        self._callback = None
-        self._connection = None
-        self._pending_update_slot = 0
-
-    async def place_order_v3(self, market, price, size, side, order_type, client_order_id, tag, market_index):
-        tx = Transaction()
-        # market_index = self._sub_exchange.markets.get_market_index(market)
-
-        open_orders_pda = None
-        if self._open_orders_accounts[market_index] == PublicKey("11111111111111111111111111111111"):
-            print("User doesn't have open orders account for this asset. Initializing for market: " + str(market))
-            init_ix, _open_orders_pda = await initialize_open_orders_ix(
-                self._asset,
-                market,
-                self._parent.public_key(),
-                self._margin_account_address
-            )
-            open_orders_pda = _open_orders_pda
-            tx.add(init_ix)
-        else:
-            open_orders_pda = self._open_orders_accounts[market_index]
-
-        order_ix = place_order_v3_ix(
-            self._asset,
-            market_index,
-            price,
-            size,
-            side,
-            order_type,
-            client_order_id,
-            tag,
-            self._margin_account_address,
-            self._parent.public_key(),
-            open_orders_pda,
-            self._parent.whitelist_trading_fees_address
-        )
-
-        tx.add(order_ix)
-
-        txId = await process_transaction(self._parent.provider, tx)
-        self._open_orders_accounts[market_index] = open_orders_pda
-        return txId
+async def place_order(provider, asset, market, price, size, side, type, client_order_id=0, tag="SDK"):
+    ret = await place_order_v3(
+        # self.market_identifier_to_public_key(asset, market),
+        provider,
+        PublicKey("2YJaZTe5FGDbjbXmKLMw28L7ZhsgaxrFbGmN6Wdc42UN"),
+        price,
+        size,
+        side,
+        type,
+        client_order_id,
+        tag,
+        market
+    )
+    return ret

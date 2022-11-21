@@ -772,7 +772,7 @@ async def initialize_open_orders_ix(asset, market, user_key, margin_account):
 async def process_transaction(provider: Provider, tx: Transaction, signers=None, opts=None, use_ledger=False):
     # txSig = TransactionSignature()
     blockhash = await provider.connection.get_recent_blockhash()
-    tx.recent_blockhash = blockhash
+    tx.recent_blockhash = blockhash["result"]["value"]["blockhash"]
     # Exchange.ledger_wallet.public_key if use_ledger else
     tx.fee_payer = provider.wallet.public_key
     if signers is None:
